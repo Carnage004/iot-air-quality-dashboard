@@ -5,6 +5,7 @@ NOTE: data is SIMULATED for demonstration. Upload a CSV to analyse real sensor d
 """
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
@@ -162,6 +163,40 @@ def delta_1h(g):
 
 
 
+
+# ------------------------------------------------------------------ live feed (data.gov.in)
+RESOURCE_ID = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"   # "Real time Air Quality Index from various location"
+API_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
+
+
+@st.cache_data(ttl=900, show_spinner="Fetching live data from data.gov.in ...")
+def fetch_cpcb(api_key: str, state: str):
+    """Download the current CPCB station feed. Cached for 15 minutes. Raises RuntimeError with a key-safe message."""
+    rows, offset, page = [], 0, 500
+    try:
+        while True:
+            params = {"api-key": api_key, "format": "json", "limit": page, "offset": offset}
+            if state != "All India":
+                params["filters[state]"] = state
+            r = requests.get(API_URL, params=params, timeout=30)
+            r.raise_for_status()
+            recs = r.json().get("records", [])
+            rows += recs
+            if len(recs) < page or offset >= 20000:
+                break
+            offset += page
+    except requests.HTTPError as e:      # never put the URL in the message: it contains the API key
+        code = e.response.status_code if e.response is not None else "?"
+        hint = " (check that your API key is valid)" if code in (401, 403) else ""
+        raise RuntimeError(f"data.gov.in returned HTTP {code}{hint}.") from None
+    except requests.RequestException:
+        raise RuntimeError("Could not reach data.gov.in (network error or timeout).") from None
+    except ValueError:
+        raise RuntimeError("data.gov.in returned an unreadable response.") from None
+    if not rows:
+        raise RuntimeError("data.gov.in returned no records for this selection.")
+    return pd.DataFrame(rows)
+
 # ------------------------------------------------------------------ snapshot mode (data.gov.in / CPCB live feed)
 PM10_BINS = [0, 50, 100, 250, 350, 430, 1e4]
 UNIT = {"PM2.5": "µg/m³", "PM10": "µg/m³", "NO2": "µg/m³", "SO2": "µg/m³", "O3": "µg/m³", "NH3": "µg/m³", "CO": "mg/m³"}
@@ -175,7 +210,7 @@ def snap_category(pol, v):
     return None
 
 
-def snapshot_view(raw: pd.DataFrame):
+def snapshot_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
     """Dashboard for a single-timestamp, long-format feed (one row per station x pollutant)."""
     d = raw.copy()
     d["pollutant_id"] = d.pollutant_id.astype(str).str.upper().replace({"OZONE": "O3"})
@@ -192,7 +227,7 @@ def snapshot_view(raw: pd.DataFrame):
     d = d[d.state == state]
     pols = sorted(d.pollutant_id.unique())
     pol = st.sidebar.selectbox("Pollutant", pols, index=pols.index("PM2.5") if "PM2.5" in pols else 0)
-    st.sidebar.caption("Data source: uploaded CSV (snapshot)")
+    st.sidebar.caption(f"Data source: {source_label} (snapshot)")
 
     s = d[(d.pollutant_id == pol) & d.pollutant_avg.notna()]
     if s.empty:
@@ -276,10 +311,41 @@ def snapshot_view(raw: pd.DataFrame):
 
 # ------------------------------------------------------------------ sidebar
 st.sidebar.title("🌫️ Controls")
-up = st.sidebar.file_uploader("Upload your own sensor CSV (optional)", type="csv",
-                              help="Columns: timestamp, node, pm25, co2, temp, humidity. "
-                                   "Optional: region, lat, lon (for the map).")
-if up is not None:
+MODES = ["Simulated demo", "Live: CPCB via data.gov.in", "Upload CSV"]
+mode = st.sidebar.radio("Data source", MODES)
+
+if mode == MODES[1]:
+    try:
+        key = st.secrets.get("DATA_GOV_API_KEY", "")
+    except Exception:
+        key = ""
+    if not key:
+        key = st.sidebar.text_input("data.gov.in API key", type="password",
+                                    help="Free: register at data.gov.in, then copy the key from My Account. "
+                                         "On a deployed app, store it in Streamlit Secrets as DATA_GOV_API_KEY.")
+    fetch_state = st.sidebar.selectbox("State to fetch", ["Maharashtra", "All India"])
+    if st.sidebar.button("🔄 Refresh now"):
+        fetch_cpcb.clear()
+    if not key:
+        st.title("IoT Based Air Quality Dashboard")
+        st.info("Enter your data.gov.in API key in the sidebar to load live CPCB readings.")
+        st.stop()
+    try:
+        live = fetch_cpcb(key.strip(), fetch_state)
+    except RuntimeError as e:
+        st.title("IoT Based Air Quality Dashboard")
+        st.error(str(e))
+        st.stop()
+    snapshot_view(live, "live CPCB feed (data.gov.in), cached 15 min")   # stops afterwards
+
+elif mode == MODES[2]:
+    up = st.sidebar.file_uploader("Upload a CSV", type="csv",
+                                  help="Time series: timestamp, node, pm25, co2, temp, humidity "
+                                       "(optional: region, lat, lon). Or a CPCB snapshot from data.gov.in.")
+    if up is None:
+        st.title("IoT Based Air Quality Dashboard")
+        st.info("Upload a CSV in the sidebar, or switch the data source to *Simulated demo* or *Live*.")
+        st.stop()
     try:
         raw = pd.read_csv(up)
     except Exception as e:
@@ -334,7 +400,7 @@ ncolor = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(sorted(df_all.node.
 # ------------------------------------------------------------------ header + KPIs
 st.title("IoT Based Air Quality Dashboard")
 st.caption("IoT sensor analytics across Maharashtra: PM2.5, CO₂, temperature, humidity · "
-           "CPCB (India) PM2.5 categories" + (" · ⚠️ simulated demo data" if up is None else ""))
+           "CPCB (India) PM2.5 categories" + (" · ⚠️ simulated demo data" if mode == MODES[0] else ""))
 
 if len(nodes) <= 5:
     cols = st.columns(len(nodes))
