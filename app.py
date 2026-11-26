@@ -1,5 +1,5 @@
 """
-IoT Air Quality Dashboard (Streamlit)
+Maharashtra IoT Air Quality Dashboard (Streamlit)
 Run:  streamlit run app.py
 NOTE: data is SIMULATED for demonstration. Upload a CSV to analyse real sensor data.
 """
@@ -161,6 +161,119 @@ def delta_1h(g):
     return last.pm25 - (ref.iloc[-1].pm25 if len(ref) else last.pm25)
 
 
+
+# ------------------------------------------------------------------ snapshot mode (data.gov.in / CPCB live feed)
+PM10_BINS = [0, 50, 100, 250, 350, 430, 1e4]
+UNIT = {"PM2.5": "µg/m³", "PM10": "µg/m³", "NO2": "µg/m³", "SO2": "µg/m³", "O3": "µg/m³", "NH3": "µg/m³", "CO": "mg/m³"}
+
+
+def snap_category(pol, v):
+    if pol == "PM2.5":
+        return CATS[int(np.digitize(v, BINS[1:-1]))]
+    if pol == "PM10":
+        return CATS[int(np.digitize(v, PM10_BINS[1:-1]))]
+    return None
+
+
+def snapshot_view(raw: pd.DataFrame):
+    """Dashboard for a single-timestamp, long-format feed (one row per station x pollutant)."""
+    d = raw.copy()
+    d["pollutant_id"] = d.pollutant_id.astype(str).str.upper().replace({"OZONE": "O3"})
+    for c in ("pollutant_min", "pollutant_max", "pollutant_avg", "latitude", "longitude"):
+        if c in d:
+            d[c] = pd.to_numeric(d[c], errors="coerce")
+    stamp = d["last_update"].iloc[0] if "last_update" in d and len(d) else "n/a"
+    st.title("India Air Quality: Station Snapshot")
+    st.caption(f"Real CPCB station data · single snapshot, last update **{stamp}** · "
+               "no time series, so trends, forecast and anomaly detection are not available for this file")
+
+    states = sorted(d.state.dropna().unique())
+    state = st.sidebar.selectbox("State", states, index=states.index("Maharashtra") if "Maharashtra" in states else 0)
+    d = d[d.state == state]
+    pols = sorted(d.pollutant_id.unique())
+    pol = st.sidebar.selectbox("Pollutant", pols, index=pols.index("PM2.5") if "PM2.5" in pols else 0)
+    st.sidebar.caption("Data source: uploaded CSV (snapshot)")
+
+    s = d[(d.pollutant_id == pol) & d.pollutant_avg.notna()]
+    if s.empty:
+        st.warning(f"No {pol} readings for {state} in this file.")
+        st.stop()
+    unit = UNIT.get(pol, "")
+    city = (s.groupby("city").agg(avg=("pollutant_avg", "mean"), stations=("station", "nunique"),
+                                  lat=("latitude", "mean"), lon=("longitude", "mean")).reset_index())
+    city["avg"] = city.avg.round(1)
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Stations reporting", f"{s.station.nunique()}")
+    k2.metric("Cities", f"{city.city.nunique()}")
+    k3.metric(f"Mean {pol}", f"{s.pollutant_avg.mean():.1f} {unit}")
+    worst = city.loc[city.avg.idxmax()]
+    k4.metric("Highest city", worst.city, f"{worst.avg:.0f} {unit}", delta_color="off")
+
+    tm, tr, tp, tc, td = st.tabs(["🗺️ Map", "📊 City ranking", "🧪 All pollutants", "📍 Station detail", "🗂️ Data"])
+
+    with tm:
+        s2 = s.copy()
+        s2["cat"] = s2.pollutant_avg.apply(lambda v: snap_category(pol, v))
+        s2["size"] = s2.pollutant_avg.clip(lower=1)
+        span = max(s2.latitude.max() - s2.latitude.min(), s2.longitude.max() - s2.longitude.min())
+        kw = dict(lat="latitude", lon="longitude", size="size", hover_name="station",
+                  hover_data={"city": True, "pollutant_avg": True, "pollutant_min": True, "pollutant_max": True,
+                              "latitude": False, "longitude": False, "size": False},
+                  zoom=5.2 if span < 8 else 3.6, size_max=22, map_style="open-street-map", height=620,
+                  center={"lat": float(s2.latitude.mean()), "lon": float(s2.longitude.mean())})
+        if pol in ("PM2.5", "PM10"):
+            fig = px.scatter_map(s2, color="cat", color_discrete_map=CAT_COLOR, category_orders={"cat": CATS}, **kw)
+        else:
+            fig = px.scatter_map(s2, color="pollutant_avg", color_continuous_scale="YlOrRd", **kw)
+        fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h", y=1.02, title_text=""))
+        st.plotly_chart(fig, width="stretch")
+        st.caption(f"Each dot is one monitoring station ({pol}, {unit}). "
+                   + ("Colours follow CPCB categories." if pol in ("PM2.5", "PM10") else "Colour shows the value."))
+
+    with tr:
+        rk = city.sort_values("avg")
+        rk["category"] = rk.avg.apply(lambda v: snap_category(pol, v))
+        if pol in ("PM2.5", "PM10"):
+            bar = px.bar(rk, x="avg", y="city", color="category", orientation="h", color_discrete_map=CAT_COLOR,
+                         category_orders={"category": CATS}, hover_data=["stations"], labels={"avg": f"{pol} ({unit})", "city": ""})
+        else:
+            bar = px.bar(rk, x="avg", y="city", orientation="h", hover_data=["stations"],
+                         labels={"avg": f"{pol} ({unit})", "city": ""})
+        bar.update_layout(height=max(420, 22 * len(rk) + 120), title=f"{pol} by city (average across stations)")
+        st.plotly_chart(bar, width="stretch")
+
+    with tp:
+        allp = d[d.pollutant_avg.notna()].pivot_table(index="city", columns="pollutant_id", values="pollutant_avg", aggfunc="mean")
+        scaled = (allp - allp.min()) / (allp.max() - allp.min()).replace(0, np.nan)
+        hm = go.Figure(go.Heatmap(z=scaled.values, x=allp.columns, y=allp.index, colorscale="YlOrRd",
+                                  text=allp.round(0).astype("Int64").astype(str).replace("<NA>", "").values,
+                                  texttemplate="%{text}", showscale=False, hoverongaps=False))
+        hm.update_layout(height=max(420, 22 * len(allp) + 120), title="All pollutants by city (numbers = value, colour = relative within each pollutant)")
+        st.plotly_chart(hm, width="stretch")
+        st.caption("Units: CO in mg/m³, all others in µg/m³. Colours are scaled per pollutant, so compare cities, not columns.")
+
+    with tc:
+        cities = sorted(s.city.unique())
+        cc = st.selectbox("City", cities, index=cities.index(worst.city))
+        sc = s[s.city == cc].sort_values("pollutant_avg")
+        fig = go.Figure(go.Bar(x=sc.pollutant_avg, y=sc.station, orientation="h",
+                               error_x=dict(type="data", symmetric=False,
+                                            array=(sc.pollutant_max - sc.pollutant_avg).fillna(0),
+                                            arrayminus=(sc.pollutant_avg - sc.pollutant_min).fillna(0)),
+                               marker_color="#c44e52"))
+        fig.update_layout(height=max(300, 60 * len(sc) + 120), title=f"{cc}: {pol} per station (bars = average, whiskers = min to max)",
+                          xaxis_title=f"{pol} ({unit})")
+        st.plotly_chart(fig, width="stretch")
+
+    with td:
+        cols = [c for c in ["state", "city", "station", "last_update", "pollutant_id", "pollutant_min",
+                            "pollutant_max", "pollutant_avg", "latitude", "longitude"] if c in d.columns]
+        st.dataframe(d[cols], width="stretch", hide_index=True)
+        st.download_button("⬇️ Download this state's data (CSV)", d[cols].to_csv(index=False).encode(),
+                           f"{state.lower().replace(' ', '_')}_snapshot.csv", "text/csv")
+    st.stop()
+
 # ------------------------------------------------------------------ sidebar
 st.sidebar.title("🌫️ Controls")
 up = st.sidebar.file_uploader("Upload your own sensor CSV (optional)", type="csv",
@@ -169,14 +282,19 @@ up = st.sidebar.file_uploader("Upload your own sensor CSV (optional)", type="csv
 if up is not None:
     try:
         raw = pd.read_csv(up)
-        missing = {"timestamp", "node", *SENSORS} - set(raw.columns)
-        if missing:
-            st.sidebar.error(f"Missing columns: {', '.join(sorted(missing))}")
-            st.stop()
-        source = "Uploaded CSV"
     except Exception as e:
         st.sidebar.error(f"Could not read file: {e}")
         st.stop()
+    if {"pollutant_id", "pollutant_avg", "city", "state"} <= set(raw.columns):
+        snapshot_view(raw)          # data.gov.in / CPCB snapshot format (stops afterwards)
+    missing = {"timestamp", "node", *SENSORS} - set(raw.columns)
+    if missing:
+        st.sidebar.error("This file is not in a supported format. Missing columns: "
+                         f"{', '.join(sorted(missing))}. Expected either a time-series CSV "
+                         "(timestamp, node, pm25, co2, temp, humidity) or a CPCB snapshot "
+                         "(state, city, station, pollutant_id, pollutant_avg, latitude, longitude).")
+        st.stop()
+    source = "Uploaded CSV"
 else:
     raw, source = simulate(), f"Simulated: {len(CITIES)} Maharashtra cities, 14 days"
 
