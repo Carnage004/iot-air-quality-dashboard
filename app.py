@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 from sklearn.ensemble import IsolationForest, RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(page_title="Maharashtra Air Quality Dashboard", page_icon="🌫️", layout="wide")
+st.set_page_config(page_title="IoT Based Air Quality Dashboard", page_icon="🌫️", layout="wide")
 
 # ------------------------------------------------------------------ constants
 # name: (region, lat, lon, pollution factor, temp offset °C, humidity offset %)
