@@ -214,7 +214,7 @@ if not nodes or df.empty:
 ncolor = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(sorted(df_all.node.unique()))}
 
 # ------------------------------------------------------------------ header + KPIs
-st.title("Maharashtra Air Quality Dashboard")
+st.title("IoT Based Air Quality Dashboard")
 st.caption("IoT sensor analytics across Maharashtra: PM2.5, CO₂, temperature, humidity · "
            "CPCB (India) PM2.5 categories" + (" · ⚠️ simulated demo data" if up is None else ""))
 
