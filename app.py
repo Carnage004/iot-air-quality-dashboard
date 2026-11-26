@@ -3,6 +3,8 @@ Maharashtra IoT Air Quality Dashboard (Streamlit)
 Run:  streamlit run app.py
 NOTE: data is SIMULATED for demonstration. Upload a CSV to analyse real sensor data.
 """
+import time
+
 import numpy as np
 import pandas as pd
 import requests
@@ -169,6 +171,12 @@ RESOURCE_ID = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"   # "Real time Air Quality 
 API_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
 
 
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+                         "Chrome/124.0 Safari/537.36",
+           "Accept": "application/json,text/plain,*/*"}
+RENAME = {"min_value": "pollutant_min", "max_value": "pollutant_max", "avg_value": "pollutant_avg"}
+
+
 @st.cache_data(ttl=900, show_spinner="Fetching live data from data.gov.in ...")
 def fetch_cpcb(api_key: str, state: str):
     """Download the current CPCB station feed. Cached for 15 minutes. Raises RuntimeError with a key-safe message."""
@@ -178,24 +186,34 @@ def fetch_cpcb(api_key: str, state: str):
             params = {"api-key": api_key, "format": "json", "limit": page, "offset": offset}
             if state != "All India":
                 params["filters[state]"] = state
-            r = requests.get(API_URL, params=params, timeout=30)
+            for attempt in range(3):                       # a couple of retries for slow/flaky responses
+                try:
+                    r = requests.get(API_URL, params=params, headers=HEADERS, timeout=(15, 90))
+                    break
+                except (requests.ConnectionError, requests.Timeout):
+                    if attempt == 2:
+                        raise
+                    time.sleep(1.5 * (attempt + 1))
             r.raise_for_status()
-            recs = r.json().get("records", [])
+            j = r.json()
+            recs = j.get("records", [])
             rows += recs
-            if len(recs) < page or offset >= 20000:
+            total = int(j.get("total") or 0)
+            offset += len(recs)
+            if not recs or (total and offset >= total) or offset >= 20000:
                 break
-            offset += page
     except requests.HTTPError as e:      # never put the URL in the message: it contains the API key
         code = e.response.status_code if e.response is not None else "?"
         hint = " (check that your API key is valid)" if code in (401, 403) else ""
         raise RuntimeError(f"data.gov.in returned HTTP {code}{hint}.") from None
-    except requests.RequestException:
-        raise RuntimeError("Could not reach data.gov.in (network error or timeout).") from None
-    except ValueError:
+    except requests.RequestException as e:   # class name only: safe, never includes the URL/key
+        raise RuntimeError(f"Could not reach data.gov.in ({type(e).__name__}). "
+                           "Check your internet connection or try a different network.") from None
+    except (ValueError, TypeError):
         raise RuntimeError("data.gov.in returned an unreadable response.") from None
     if not rows:
         raise RuntimeError("data.gov.in returned no records for this selection.")
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows).rename(columns=RENAME)
 
 # ------------------------------------------------------------------ snapshot mode (data.gov.in / CPCB live feed)
 PM10_BINS = [0, 50, 100, 250, 350, 430, 1e4]
