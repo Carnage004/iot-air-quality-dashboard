@@ -199,17 +199,23 @@ ALIASES = {"pm2.5": "pm25", "pm2_5": "pm25", "pm_25": "pm25", "pm 2.5": "pm25",
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Lower-case / trim headers, map common aliases, and adapt near-miss time-series files."""
+    """Lower-case / trim headers, map common aliases, and adapt near-miss files to a supported format."""
     df = df.copy()
     df.columns = [ALIASES.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
     cols = set(df.columns)
-    if "node" not in cols and "city" in cols and {"timestamp", "co2", "temp", "humidity"} <= cols:
+    sensors = {"co2", "temp", "humidity"} <= cols
+    has_val = "aqi" in cols or "pm25" in cols
+    if "node" not in cols and "city" in cols and "timestamp" in cols and sensors:
         df = df.rename(columns={"city": "node"})                 # sensor file that calls its nodes "city"
-    elif "timestamp" not in cols and "date" in cols and {"node", "co2", "temp", "humidity"} <= cols:
+    elif "timestamp" not in cols and "date" in cols and "node" in cols and sensors:
         df = df.rename(columns={"date": "timestamp"})
-    elif "timestamp" in cols and "date" not in cols and "node" not in cols and "city" in cols \
-            and ("aqi" in cols or "pm25" in cols):
-        df = df.rename(columns={"timestamp": "date"})            # daily history that uses "timestamp"
+    elif "timestamp" in cols and "node" not in cols and "city" not in cols and "pm25" in cols and sensors:
+        df["node"] = "Sensor 1"                                  # single-sensor IoT file without a node column
+    elif "node" not in cols and has_val and ("timestamp" in cols or "date" in cols):
+        if "timestamp" in cols and "date" not in cols:           # daily/hourly history that uses "timestamp"
+            df = df.rename(columns={"timestamp": "date"})
+        if "city" not in cols:
+            df["city"] = "Uploaded series"                       # single-location file without a city column
     return df
 
 
@@ -383,7 +389,7 @@ HIST_POLS = ["aqi", "pm25", "pm10", "no2", "so2", "co", "o3", "nh3"]
 HIST_LABEL = {"aqi": "AQI", "pm25": "PM2.5 (µg/m³)", "pm10": "PM10 (µg/m³)", "no2": "NO₂ (µg/m³)",
               "so2": "SO₂ (µg/m³)", "co": "CO (mg/m³)", "o3": "O₃ (µg/m³)", "nh3": "NH₃ (µg/m³)"}
 NAAQS_24H = {"pm25": 60, "pm10": 100, "no2": 80, "so2": 80}          # India NAAQS 24-hour limits
-HIST_RULE = {"Daily": None, "Weekly": "W", "Monthly": "MS", "Yearly": "YS"}
+HIST_RULE = {"Raw (hourly)": None, "Daily": "D", "Weekly": "W", "Monthly": "MS", "Yearly": "YS"}
 SEASON = {12: "Winter", 1: "Winter", 2: "Winter", 3: "Summer", 4: "Summer", 5: "Summer",
           6: "Monsoon", 7: "Monsoon", 8: "Monsoon", 9: "Monsoon", 10: "Post-monsoon", 11: "Post-monsoon"}
 SEASON_ORDER = ["Winter", "Summer", "Monsoon", "Post-monsoon"]
@@ -403,6 +409,9 @@ def prep_historical(raw: pd.DataFrame):
     n0 = len(d)
     d = d.rename(columns={"latitude": "lat", "longitude": "lon"})
     d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    if d["date"].isna().all() and {"year", "month", "day"} <= set(d.columns):     # rebuild from parts
+        parts = d[["year", "month", "day"] + (["hour"] if "hour" in d.columns else [])].apply(pd.to_numeric, errors="coerce")
+        d["date"] = pd.to_datetime(parts, errors="coerce")
     d["city"] = d["city"].astype(str).str.strip()
     pols = [c for c in HIST_POLS if c in d.columns]
     for c in pols + [c for c in ("lat", "lon") if c in d.columns]:
@@ -449,7 +458,9 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
     rng_dates = st.sidebar.date_input("Date range", (dmin, dmax), min_value=dmin, max_value=dmax)
     d0, d1 = rng_dates if isinstance(rng_dates, tuple) and len(rng_dates) == 2 else (dmin, dmax)
     metric = st.sidebar.selectbox("Metric", pols, format_func=HIST_LABEL.get)
-    res = st.sidebar.selectbox("Time resolution", list(HIST_RULE), index=2)
+    subdaily = bool((d.date != d.date.dt.normalize()).any())      # hourly (or finer) readings?
+    res_opts = list(HIST_RULE) if subdaily else ["Daily", "Weekly", "Monthly", "Yearly"]
+    res = st.sidebar.selectbox("Time resolution", res_opts, index=res_opts.index("Monthly"))
     show_bands = st.sidebar.checkbox("Show CPCB category bands", True)
     st.sidebar.caption(f"Data source: {source_label} (daily city history)")
 
@@ -466,14 +477,14 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
     ncolor = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(all_cities)}
     if bins:
         df["category"] = pd.cut(df[metric], bins, labels=CATS, include_lowest=True)
-    st.caption(f"Daily readings · **{df.city.nunique()}** cities · {df.date.min():%d %b %Y} to {df.date.max():%d %b %Y} · "
+    st.caption(f"{'Hourly' if subdaily else 'Daily'} readings · **{df.city.nunique()}** location(s) · {df.date.min():%d %b %Y} to {df.date.max():%d %b %Y} · "
                f"{len(df):,} rows" + (" · categories follow the CPCB national AQI scale" if metric == "aqi" else ""))
 
     # ---- KPIs
     k1, k2, k3, k4, k5 = st.columns(5)
     k1.metric(f"Mean {label}", f"{df[metric].mean():.1f}")
     pk = df.loc[df[metric].idxmax()]
-    k2.metric("Peak", f"{pk[metric]:.0f}", f"{pk.city}, {pk.date:%d %b %Y}", delta_color="off")
+    k2.metric("Peak", f"{pk[metric]:.0f}", f"{pk.city}, {pk.date:%d %b %Y}" if not subdaily else f"{pk.city}, {pk.date:%d %b %Y %H:%M}", delta_color="off")
     if bins:
         k3.metric("Days 'Poor' or worse", f"{(df[metric] > bins[3]).mean() * 100:.2f}%")
     else:
@@ -492,7 +503,7 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
 
     # ---- trends
     with t1:
-        rule = HIST_RULE[res]
+        rule = None if (res == "Daily" and not subdaily) else HIST_RULE[res]
         series = {}
         for c in sel:
             g = df[df.city == c].set_index("date")[metric]
@@ -574,6 +585,13 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
                     title=f"Mean {label} by season", labels={metric: label, "city": ""})
         sb.update_layout(height=380, legend_title_text="")
         st.plotly_chart(sb, width="stretch")
+
+        if subdaily:
+            hp_ = df.assign(hour=df.date.dt.hour).groupby(["city", "hour"])[metric].mean().reset_index()
+            hl = px.line(hp_, x="hour", y=metric, color="city", markers=True, color_discrete_map=ncolor,
+                         title=f"Average {label} by hour of day", labels={metric: label, "hour": "Hour of day"})
+            hl.update_layout(height=380)
+            st.plotly_chart(hl, width="stretch")
 
         hc = st.selectbox("Month × year heatmap for", sel)
         p2 = df[df.city == hc].pivot_table(index="year", columns="month", values=metric, aggfunc="mean")
