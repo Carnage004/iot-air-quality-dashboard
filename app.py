@@ -1,8 +1,16 @@
 """
 Maharashtra IoT Air Quality Dashboard (Streamlit)
 Run:  streamlit run app.py
-NOTE: data is SIMULATED for demonstration. Upload a CSV to analyse real sensor data.
+
+Data sources
+  1. Simulated demo (14 days, 15-min readings, Maharashtra cities)
+  2. Live CPCB feed via data.gov.in (station snapshot)
+  3. Upload CSV: three formats are detected automatically
+       a) IoT time series      : timestamp, node, pm25, co2, temp, humidity
+       b) CPCB snapshot        : state, city, station, pollutant_id, pollutant_avg, latitude, longitude
+       c) Daily city AQI history: city, date, aqi and/or pm25 (+ pm10, no2, so2, co, o3 ...)
 """
+import calendar
 import time
 
 import numpy as np
@@ -53,10 +61,31 @@ CITIES = {
 }
 DEFAULT_PICK = ["Mumbai", "Pune", "Nagpur", "Nashik", "Chhatrapati Sambhajinagar"]
 
+# Coordinates for common Indian cities, used to draw a map when an uploaded file has no lat/lon columns
+CITY_COORDS = {
+    "Delhi": (28.614, 77.209), "Mumbai": (19.076, 72.878), "Bengaluru": (12.972, 77.594),
+    "Bangalore": (12.972, 77.594), "Kolkata": (22.573, 88.364), "Chennai": (13.083, 80.270),
+    "Hyderabad": (17.385, 78.487), "Lucknow": (26.847, 80.947), "Jaipur": (26.912, 75.787),
+    "Pune": (18.520, 73.857), "Ahmedabad": (23.023, 72.572), "Patna": (25.594, 85.138),
+    "Bhopal": (23.259, 77.413), "Chandigarh": (30.733, 76.779), "Nagpur": (21.146, 79.088),
+    "Kanpur": (26.449, 80.332), "Indore": (22.719, 75.857), "Surat": (21.170, 72.831),
+    "Gurugram": (28.459, 77.027), "Noida": (28.535, 77.391), "Ghaziabad": (28.667, 77.449),
+    "Thane": (19.218, 72.978), "Nashik": (19.998, 73.790), "Kochi": (9.931, 76.267),
+    "Thiruvananthapuram": (8.524, 76.936), "Guwahati": (26.144, 91.736),
+    "Bhubaneswar": (20.296, 85.824), "Ranchi": (23.344, 85.310), "Amritsar": (31.634, 74.873),
+    "Varanasi": (25.317, 82.973), "Agra": (27.177, 78.008), "Coimbatore": (11.017, 76.956),
+    "Vadodara": (22.307, 73.181), "Raipur": (21.251, 81.630), "Dehradun": (30.316, 78.032),
+    "Visakhapatnam": (17.687, 83.218), "Jodhpur": (26.239, 73.024), "Faridabad": (28.409, 77.313),
+}
+
+# PM2.5 categories (CPCB, 24h average, µg/m³)
 BINS = [0, 30, 60, 90, 120, 250, 1e4]
 CATS = ["Good", "Satisfactory", "Moderate", "Poor", "Very Poor", "Severe"]
 COLS = ["#2e9e4f", "#9ccc3c", "#f2d12e", "#f28c28", "#d9402b", "#7a1f1f"]
 CAT_COLOR = dict(zip(CATS, COLS))
+# National AQI categories (CPCB): 0-50 Good ... 401+ Severe
+AQI_BINS = [0, 50, 100, 200, 300, 400, 1e4]
+PM10_BINS = [0, 50, 100, 250, 350, 430, 1e4]
 SENSORS = ["pm25", "co2", "temp", "humidity"]
 SENSOR_LABEL = {"pm25": "PM2.5 (µg/m³)", "co2": "CO₂ (ppm)", "temp": "Temperature (°C)", "humidity": "Humidity (%)"}
 PALETTE = px.colors.qualitative.Alphabet + px.colors.qualitative.Dark24
@@ -164,12 +193,33 @@ def delta_1h(g):
     return last.pm25 - (ref.iloc[-1].pm25 if len(ref) else last.pm25)
 
 
+# ------------------------------------------------------------------ CSV format detection
+ALIASES = {"pm2.5": "pm25", "pm2_5": "pm25", "pm_25": "pm25", "pm 2.5": "pm25",
+           "date_time": "timestamp", "datetime": "timestamp", "city_name": "city"}
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Lower-case / trim headers, map common aliases, and adapt near-miss time-series files."""
+    df = df.copy()
+    df.columns = [ALIASES.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
+    cols = set(df.columns)
+    if "node" not in cols and "city" in cols and {"timestamp", "co2", "temp", "humidity"} <= cols:
+        df = df.rename(columns={"city": "node"})                 # sensor file that calls its nodes "city"
+    elif "timestamp" not in cols and "date" in cols and {"node", "co2", "temp", "humidity"} <= cols:
+        df = df.rename(columns={"date": "timestamp"})
+    elif "timestamp" in cols and "date" not in cols and "node" not in cols and "city" in cols \
+            and ("aqi" in cols or "pm25" in cols):
+        df = df.rename(columns={"timestamp": "date"})            # daily history that uses "timestamp"
+    return df
+
+
+def is_historical(cols: set) -> bool:
+    return {"city", "date"} <= cols and ("aqi" in cols or "pm25" in cols) and not {"timestamp", "node"} <= cols
 
 
 # ------------------------------------------------------------------ live feed (data.gov.in)
 RESOURCE_ID = "3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69"   # "Real time Air Quality Index from various location"
 API_URL = f"https://api.data.gov.in/resource/{RESOURCE_ID}"
-
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/124.0 Safari/537.36",
@@ -215,8 +265,8 @@ def fetch_cpcb(api_key: str, state: str):
         raise RuntimeError("data.gov.in returned no records for this selection.")
     return pd.DataFrame(rows).rename(columns=RENAME)
 
+
 # ------------------------------------------------------------------ snapshot mode (data.gov.in / CPCB live feed)
-PM10_BINS = [0, 50, 100, 250, 350, 430, 1e4]
 UNIT = {"PM2.5": "µg/m³", "PM10": "µg/m³", "NO2": "µg/m³", "SO2": "µg/m³", "O3": "µg/m³", "NH3": "µg/m³", "CO": "mg/m³"}
 
 
@@ -327,6 +377,291 @@ def snapshot_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
                            f"{state.lower().replace(' ', '_')}_snapshot.csv", "text/csv")
     st.stop()
 
+
+# ------------------------------------------------------------------ daily city history mode (city, date, aqi / pm25 / ...)
+HIST_POLS = ["aqi", "pm25", "pm10", "no2", "so2", "co", "o3", "nh3"]
+HIST_LABEL = {"aqi": "AQI", "pm25": "PM2.5 (µg/m³)", "pm10": "PM10 (µg/m³)", "no2": "NO₂ (µg/m³)",
+              "so2": "SO₂ (µg/m³)", "co": "CO (mg/m³)", "o3": "O₃ (µg/m³)", "nh3": "NH₃ (µg/m³)"}
+NAAQS_24H = {"pm25": 60, "pm10": 100, "no2": 80, "so2": 80}          # India NAAQS 24-hour limits
+HIST_RULE = {"Daily": None, "Weekly": "W", "Monthly": "MS", "Yearly": "YS"}
+SEASON = {12: "Winter", 1: "Winter", 2: "Winter", 3: "Summer", 4: "Summer", 5: "Summer",
+          6: "Monsoon", 7: "Monsoon", 8: "Monsoon", 9: "Monsoon", 10: "Post-monsoon", 11: "Post-monsoon"}
+SEASON_ORDER = ["Winter", "Summer", "Monsoon", "Post-monsoon"]
+
+
+def metric_bins(m):
+    return {"aqi": AQI_BINS, "pm25": BINS, "pm10": PM10_BINS}.get(m)
+
+
+def cat_for(v, bins):
+    return CATS[int(np.digitize(v, bins[1:-1]))]
+
+
+@st.cache_data(show_spinner=False)
+def prep_historical(raw: pd.DataFrame):
+    d = raw.copy()
+    n0 = len(d)
+    d = d.rename(columns={"latitude": "lat", "longitude": "lon"})
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d["city"] = d["city"].astype(str).str.strip()
+    pols = [c for c in HIST_POLS if c in d.columns]
+    for c in pols + [c for c in ("lat", "lon") if c in d.columns]:
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    q = {"Rows in file": n0, "Unreadable dates": int(d.date.isna().sum())}
+    d = d.dropna(subset=["date"])
+    q["Duplicate city-date rows"] = int(d.duplicated(["city", "date"]).sum())
+    d = d.drop_duplicates(["city", "date"]).sort_values(["city", "date"]).reset_index(drop=True)
+    q["Missing values"] = int(d[pols].isna().sum().sum())
+    q["Negative values"] = int((d[pols] < 0).sum().sum())
+    d[pols] = d[pols].where(d[pols] >= 0)
+    d[pols] = d.groupby("city")[pols].transform(lambda s: s.interpolate(limit=7).bfill().ffill())
+    d["year"] = d.date.dt.year
+    d["month"] = d.date.dt.month
+    d["season"] = d.month.map(SEASON)
+    return d, pols, q
+
+
+def city_coords(d: pd.DataFrame):
+    out = {}
+    if {"lat", "lon"} <= set(d.columns):
+        g = d.groupby("city")[["lat", "lon"]].mean().dropna()
+        out = {c: (r.lat, r.lon) for c, r in g.iterrows()}
+    for c in d.city.unique():
+        if c not in out and c in CITY_COORDS:
+            out[c] = CITY_COORDS[c]
+    return out
+
+
+def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
+    """Dashboard for a daily, multi-city history (one row per city per day)."""
+    d, pols, q = prep_historical(raw)
+    if d.empty:
+        st.title("India Air Quality: City History")
+        st.error("No usable rows found: the `date` column could not be read as dates.")
+        st.stop()
+
+    # ---- sidebar controls
+    all_cities = sorted(d.city.unique())
+    main = pols[0]
+    default = all_cities if len(all_cities) <= 10 else list(d.groupby("city")[main].mean().nlargest(8).index)
+    sel = st.sidebar.multiselect("Cities", all_cities, default=default)
+    dmin, dmax = d.date.dt.date.min(), d.date.dt.date.max()
+    rng_dates = st.sidebar.date_input("Date range", (dmin, dmax), min_value=dmin, max_value=dmax)
+    d0, d1 = rng_dates if isinstance(rng_dates, tuple) and len(rng_dates) == 2 else (dmin, dmax)
+    metric = st.sidebar.selectbox("Metric", pols, format_func=HIST_LABEL.get)
+    res = st.sidebar.selectbox("Time resolution", list(HIST_RULE), index=2)
+    show_bands = st.sidebar.checkbox("Show CPCB category bands", True)
+    st.sidebar.caption(f"Data source: {source_label} (daily city history)")
+
+    st.title("India Air Quality: City History")
+    if not sel:
+        st.warning("Select at least one city in the sidebar.")
+        st.stop()
+    df = d[d.city.isin(sel) & (d.date.dt.date >= d0) & (d.date.dt.date <= d1)].copy()
+    if df.empty:
+        st.warning("No data for this selection. Widen the date range.")
+        st.stop()
+
+    label, bins = HIST_LABEL[metric], metric_bins(metric)
+    ncolor = {n: PALETTE[i % len(PALETTE)] for i, n in enumerate(all_cities)}
+    if bins:
+        df["category"] = pd.cut(df[metric], bins, labels=CATS, include_lowest=True)
+    st.caption(f"Daily readings · **{df.city.nunique()}** cities · {df.date.min():%d %b %Y} to {df.date.max():%d %b %Y} · "
+               f"{len(df):,} rows" + (" · categories follow the CPCB national AQI scale" if metric == "aqi" else ""))
+
+    # ---- KPIs
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric(f"Mean {label}", f"{df[metric].mean():.1f}")
+    pk = df.loc[df[metric].idxmax()]
+    k2.metric("Peak", f"{pk[metric]:.0f}", f"{pk.city}, {pk.date:%d %b %Y}", delta_color="off")
+    if bins:
+        k3.metric("Days 'Poor' or worse", f"{(df[metric] > bins[3]).mean() * 100:.2f}%")
+    else:
+        k3.metric("Median", f"{df[metric].median():.1f}")
+    cm = df.groupby("city")[metric].mean()
+    k4.metric("Most polluted city", cm.idxmax(), f"{cm.max():.0f}", delta_color="off")
+    ym = df.groupby("year")[metric].mean()
+    if len(ym) >= 2:
+        k5.metric(f"Change {ym.index[0]} to {ym.index[-1]}", f"{ym.iloc[-1]:.1f}",
+                  f"{ym.iloc[-1] - ym.iloc[0]:+.1f} vs {ym.index[0]}", delta_color="inverse")
+    else:
+        k5.metric("Cleanest city", cm.idxmin(), f"{cm.min():.0f}", delta_color="off")
+
+    t1, t2, t3, t4, t5, t6 = st.tabs(["📈 Trends", "🏙️ City comparison", "🗓️ Seasonality",
+                                      "🧪 Pollutants", "🗺️ Map", "🗂️ Data"])
+
+    # ---- trends
+    with t1:
+        rule = HIST_RULE[res]
+        series = {}
+        for c in sel:
+            g = df[df.city == c].set_index("date")[metric]
+            series[c] = g if rule is None else g.resample(rule).mean()
+        fig = go.Figure()
+        if show_bands and bins:
+            top = max(float(s.max()) for s in series.values()) * 1.1
+            for lo, hi, col in zip(bins[:-1], bins[1:], COLS):
+                if lo < top:
+                    fig.add_hrect(y0=lo, y1=min(hi, top), fillcolor=col, opacity=.10, line_width=0)
+        for c, s in series.items():
+            fig.add_trace(go.Scatter(x=s.index, y=s.values, name=c, mode="lines", line=dict(width=1.4, color=ncolor[c])))
+        fig.update_layout(height=470, margin=dict(l=10, r=10, t=30, b=10), hovermode="x unified",
+                          legend=dict(orientation="h", y=1.1), yaxis_title=label)
+        st.plotly_chart(fig, width="stretch")
+        if len(sel) > 6:
+            st.caption("Many cities selected: click legend entries to hide lines, or pick fewer cities.")
+
+        yr = df.groupby(["year", "city"])[metric].mean().reset_index()
+        yb = px.bar(yr, x="year", y=metric, color="city", barmode="group", color_discrete_map=ncolor,
+                    title=f"Yearly mean {label}", labels={metric: label, "year": ""})
+        yb.update_layout(height=380, xaxis=dict(dtick=1))
+        st.plotly_chart(yb, width="stretch")
+
+    # ---- city comparison
+    with t2:
+        stats = df.groupby("city")[metric].agg(mean="mean", median="median",
+                                               p95=lambda s: s.quantile(.95), max="max").round(1)
+        if bins:
+            stats["% days Poor+"] = df.groupby("city")[metric].apply(lambda s: (s > bins[3]).mean() * 100).round(1)
+        stats = stats.sort_values("mean", ascending=False)
+        c1, c2 = st.columns(2)
+        rk = stats.reset_index().sort_values("mean")
+        if bins:
+            rk["category"] = rk["mean"].apply(lambda v: cat_for(v, bins))
+            bar = px.bar(rk, x="mean", y="city", color="category", orientation="h", color_discrete_map=CAT_COLOR,
+                         category_orders={"category": CATS}, title=f"City ranking by mean {label}",
+                         labels={"mean": label, "city": ""})
+        else:
+            bar = px.bar(rk, x="mean", y="city", orientation="h", title=f"City ranking by mean {label}",
+                         labels={"mean": label, "city": ""})
+        bar.update_layout(height=max(380, 30 * len(rk) + 120), legend_title_text="")
+        c1.plotly_chart(bar, width="stretch")
+        box = px.box(df, x="city", y=metric, color="city", color_discrete_map=ncolor, points=False,
+                     title=f"{label} distribution by city")
+        box.update_layout(height=max(380, 30 * len(rk) + 120), showlegend=False, xaxis_title="", yaxis_title=label)
+        c2.plotly_chart(box, width="stretch")
+
+        if bins:
+            share = df.groupby("city")["category"].value_counts(normalize=True).mul(100).rename("pct").reset_index()
+            sb = px.bar(share, x="city", y="pct", color="category", color_discrete_map=CAT_COLOR,
+                        category_orders={"category": CATS}, title="% of days in each CPCB category")
+            sb.update_layout(height=380, yaxis_title="%", xaxis_title="", legend_title_text="")
+            st.plotly_chart(sb, width="stretch")
+
+        piv = df.pivot_table(index="city", columns="year", values=metric, aggfunc="mean")
+        piv.columns = piv.columns.astype(str)
+        hm = px.imshow(piv, text_auto=".0f", aspect="auto", color_continuous_scale="YlOrRd",
+                       labels=dict(x="Year", y="", color=label), title=f"City × year: mean {label}")
+        hm.update_layout(height=max(320, 34 * len(piv) + 120))
+        st.plotly_chart(hm, width="stretch")
+        st.dataframe(stats.rename(columns={"mean": "Mean", "median": "Median", "p95": "95th pct", "max": "Max"}),
+                     width="stretch")
+
+    # ---- seasonality
+    with t3:
+        mp = df.groupby(["city", "month"])[metric].mean().reset_index()
+        ml = px.line(mp, x="month", y=metric, color="city", markers=True, color_discrete_map=ncolor,
+                     title=f"Average {label} by month of year", labels={metric: label, "month": ""})
+        ml.update_layout(height=400, xaxis=dict(tickmode="array", tickvals=list(range(1, 13)),
+                                                ticktext=[calendar.month_abbr[m] for m in range(1, 13)]))
+        st.plotly_chart(ml, width="stretch")
+
+        se = df.groupby(["city", "season"])[metric].mean().reset_index()
+        sb = px.bar(se, x="city", y=metric, color="season", barmode="group",
+                    category_orders={"season": SEASON_ORDER},
+                    color_discrete_map={"Winter": "#4c78a8", "Summer": "#f58518", "Monsoon": "#54a24b",
+                                        "Post-monsoon": "#b279a2"},
+                    title=f"Mean {label} by season", labels={metric: label, "city": ""})
+        sb.update_layout(height=380, legend_title_text="")
+        st.plotly_chart(sb, width="stretch")
+
+        hc = st.selectbox("Month × year heatmap for", sel)
+        p2 = df[df.city == hc].pivot_table(index="year", columns="month", values=metric, aggfunc="mean")
+        p2.columns = [calendar.month_abbr[m] for m in p2.columns]
+        p2.index = p2.index.astype(str)
+        h2 = px.imshow(p2, text_auto=".0f", aspect="auto", color_continuous_scale="YlOrRd",
+                       labels=dict(x="Month", y="Year", color=label), title=f"{hc}: mean {label} by month and year")
+        h2.update_layout(height=420)
+        st.plotly_chart(h2, width="stretch")
+        st.caption("Indian cities typically peak in winter (Nov to Feb) and are cleanest in the monsoon (Jun to Sep).")
+
+    # ---- pollutants
+    with t4:
+        if len(pols) < 2:
+            st.info("This file only has one pollutant column, so there is nothing to compare.")
+        else:
+            c1, c2 = st.columns(2)
+            cmx = px.imshow(df[pols].corr(), text_auto=".2f", color_continuous_scale="RdBu_r", zmin=-1, zmax=1,
+                            title="Pollutant correlation matrix")
+            cmx.update_layout(height=430)
+            c1.plotly_chart(cmx, width="stretch")
+            samp = df.sample(min(3000, len(df)), random_state=0)
+            others = [p for p in pols if p != metric]
+            xp = c2.selectbox("Compare against", others, format_func=HIST_LABEL.get)
+            sc = px.scatter(samp, x=xp, y=metric, color="city", color_discrete_map=ncolor, opacity=.5,
+                            title=f"{HIST_LABEL[xp]} vs {label}", labels={xp: HIST_LABEL[xp], metric: label})
+            sc.update_layout(height=380)
+            c2.plotly_chart(sc, width="stretch")
+
+            allp = df.groupby("city")[pols].mean()
+            scaled = (allp - allp.min()) / (allp.max() - allp.min()).replace(0, np.nan)
+            hp = go.Figure(go.Heatmap(z=scaled.values, x=[p.upper() for p in allp.columns], y=allp.index,
+                                      colorscale="YlOrRd", text=allp.round(1).astype(str).values,
+                                      texttemplate="%{text}", showscale=False))
+            hp.update_layout(height=max(360, 34 * len(allp) + 120),
+                             title="Mean pollutant levels by city (numbers = value, colour = relative within each pollutant)")
+            st.plotly_chart(hp, width="stretch")
+
+            ex = [(p, lim) for p, lim in NAAQS_24H.items() if p in pols]
+            if ex:
+                rows = [{"city": c, "pollutant": p.upper(), "pct": (g[p] > lim).mean() * 100}
+                        for c, g in df.groupby("city") for p, lim in ex]
+                eb = px.bar(pd.DataFrame(rows), x="city", y="pct", color="pollutant", barmode="group",
+                            title="% of days above the India NAAQS 24-hour limit (" +
+                                  ", ".join(f"{p.upper()} {lim}" for p, lim in ex) + " µg/m³)",
+                            labels={"pct": "% of days", "city": ""})
+                eb.update_layout(height=380, legend_title_text="")
+                st.plotly_chart(eb, width="stretch")
+
+    # ---- map
+    with t5:
+        coords = city_coords(d)
+        mp = df.groupby("city")[metric].mean().rename("value").reset_index()
+        mp["lat"] = mp.city.map(lambda c: coords.get(c, (np.nan, np.nan))[0])
+        mp["lon"] = mp.city.map(lambda c: coords.get(c, (np.nan, np.nan))[1])
+        miss = mp[mp.lat.isna()].city.tolist()
+        mp = mp.dropna(subset=["lat", "lon"])
+        if mp.empty:
+            st.info("No coordinates known for these cities. Add `lat` and `lon` columns to your CSV to see a map.")
+        else:
+            mp["value"] = mp.value.round(1)
+            kw = dict(lat="lat", lon="lon", size="value", hover_name="city", hover_data={"value": True, "lat": False, "lon": False},
+                      zoom=3.6, size_max=34, map_style="open-street-map", height=620,
+                      center={"lat": float(mp.lat.mean()), "lon": float(mp.lon.mean())})
+            if bins:
+                mp["category"] = mp.value.apply(lambda v: cat_for(v, bins))
+                fig = px.scatter_map(mp, color="category", color_discrete_map=CAT_COLOR, category_orders={"category": CATS}, **kw)
+            else:
+                fig = px.scatter_map(mp, color="value", color_continuous_scale="YlOrRd", **kw)
+            fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend=dict(orientation="h", y=1.02, title_text=""))
+            st.plotly_chart(fig, width="stretch")
+            st.caption(f"Each dot is a city, sized and coloured by its mean {label} for the selected dates."
+                       + (f" Not shown (no coordinates): {', '.join(miss)}." if miss else ""))
+
+    # ---- data
+    with t6:
+        st.subheader("Data quality")
+        qa, qb = st.columns([1, 2])
+        qa.dataframe(pd.DataFrame({"Check": list(q), "Count": list(q.values())}), width="stretch", hide_index=True)
+        qb.markdown("**Cleaning steps:** parse dates → drop duplicate city-day rows → treat negative readings as missing → "
+                    "interpolate short gaps (up to 7 days) within each city → forward/back-fill the rest.")
+        show = df.drop(columns=["year", "month"])
+        st.dataframe(show.tail(1000), width="stretch", hide_index=True)
+        st.download_button("⬇️ Download filtered data (CSV)", show.to_csv(index=False).encode(),
+                           "filtered_city_history.csv", "text/csv")
+    st.stop()
+
+
 # ------------------------------------------------------------------ sidebar
 st.sidebar.title("🌫️ Controls")
 MODES = ["Simulated demo", "Live: CPCB via data.gov.in", "Upload CSV"]
@@ -358,8 +693,9 @@ if mode == MODES[1]:
 
 elif mode == MODES[2]:
     up = st.sidebar.file_uploader("Upload a CSV", type="csv",
-                                  help="Time series: timestamp, node, pm25, co2, temp, humidity "
-                                       "(optional: region, lat, lon). Or a CPCB snapshot from data.gov.in.")
+                                  help="Accepted formats: (1) IoT time series: timestamp, node, pm25, co2, temp, humidity "
+                                       "(optional: region, lat, lon); (2) daily city history: city, date, aqi and/or pm25 "
+                                       "(+ pm10, no2, so2, co, o3); (3) CPCB snapshot from data.gov.in.")
     if up is None:
         st.title("IoT Based Air Quality Dashboard")
         st.info("Upload a CSV in the sidebar, or switch the data source to *Simulated demo* or *Live*.")
@@ -369,14 +705,21 @@ elif mode == MODES[2]:
     except Exception as e:
         st.sidebar.error(f"Could not read file: {e}")
         st.stop()
-    if {"pollutant_id", "pollutant_avg", "city", "state"} <= set(raw.columns):
+    raw = normalize_columns(raw)
+    cols_up = set(raw.columns)
+    if {"pollutant_id", "pollutant_avg", "city", "state"} <= cols_up:
         snapshot_view(raw)          # data.gov.in / CPCB snapshot format (stops afterwards)
-    missing = {"timestamp", "node", *SENSORS} - set(raw.columns)
+    if is_historical(cols_up):
+        historical_view(raw)        # daily city AQI history (stops afterwards)
+    missing = {"timestamp", "node", *SENSORS} - cols_up
     if missing:
-        st.sidebar.error("This file is not in a supported format. Missing columns: "
-                         f"{', '.join(sorted(missing))}. Expected either a time-series CSV "
-                         "(timestamp, node, pm25, co2, temp, humidity) or a CPCB snapshot "
-                         "(state, city, station, pollutant_id, pollutant_avg, latitude, longitude).")
+        st.title("IoT Based Air Quality Dashboard")
+        st.sidebar.error("This file is not in a supported format. Found columns: "
+                         f"{', '.join(map(str, raw.columns[:12]))}{' ...' if raw.shape[1] > 12 else ''}. "
+                         "Supported: (1) time series: timestamp, node, pm25, co2, temp, humidity; "
+                         "(2) daily city history: city, date, aqi and/or pm25; "
+                         "(3) CPCB snapshot: state, city, station, pollutant_id, pollutant_avg, latitude, longitude.")
+        st.error(f"Unsupported CSV format. For a time-series file the missing columns are: {', '.join(sorted(missing))}.")
         st.stop()
     source = "Uploaded CSV"
 else:
