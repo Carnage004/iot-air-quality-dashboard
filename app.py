@@ -202,6 +202,8 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Lower-case / trim headers, map common aliases, and adapt near-miss files to a supported format."""
     df = df.copy()
     df.columns = [ALIASES.get(str(c).strip().lower(), str(c).strip().lower()) for c in df.columns]
+    if "city" not in df.columns and "stationid" in df.columns:
+        df = df.rename(columns={"stationid": "city"})            # station_day / station_hour files
     cols = set(df.columns)
     sensors = {"co2", "temp", "humidity"} <= cols
     has_val = "aqi" in cols or "pm25" in cols
@@ -423,7 +425,7 @@ def prep_historical(raw: pd.DataFrame):
     q["Missing values"] = int(d[pols].isna().sum().sum())
     q["Negative values"] = int((d[pols] < 0).sum().sum())
     d[pols] = d[pols].where(d[pols] >= 0)
-    d[pols] = d.groupby("city")[pols].transform(lambda s: s.interpolate(limit=7).bfill().ffill())
+    d[pols] = d.groupby("city")[pols].transform(lambda s: s.interpolate(limit=7, limit_area="inside"))
     d["year"] = d.date.dt.year
     d["month"] = d.date.dt.month
     d["season"] = d.month.map(SEASON)
@@ -468,9 +470,10 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
     if not sel:
         st.warning("Select at least one city in the sidebar.")
         st.stop()
-    df = d[d.city.isin(sel) & (d.date.dt.date >= d0) & (d.date.dt.date <= d1)].copy()
-    if df.empty:
-        st.warning("No data for this selection. Widen the date range.")
+    df = d[d.city.isin(sel) & (d.date.dt.date >= d0) & (d.date.dt.date <= d1)].dropna(subset=[metric]).copy()
+    sel = [c for c in sel if c in set(df.city)]
+    if df.empty or not sel:
+        st.warning("No readings for this selection (the chosen cities may have no data for this metric or period).")
         st.stop()
 
     label, bins = HIST_LABEL[metric], metric_bins(metric)
@@ -624,7 +627,7 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
             allp = df.groupby("city")[pols].mean()
             scaled = (allp - allp.min()) / (allp.max() - allp.min()).replace(0, np.nan)
             hp = go.Figure(go.Heatmap(z=scaled.values, x=[p.upper() for p in allp.columns], y=allp.index,
-                                      colorscale="YlOrRd", text=allp.round(1).astype(str).values,
+                                      colorscale="YlOrRd", text=allp.round(1).astype(str).replace("nan", "").values,
                                       texttemplate="%{text}", showscale=False))
             hp.update_layout(height=max(360, 34 * len(allp) + 120),
                              title="Mean pollutant levels by city (numbers = value, colour = relative within each pollutant)")
@@ -632,7 +635,7 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
 
             ex = [(p, lim) for p, lim in NAAQS_24H.items() if p in pols]
             if ex:
-                rows = [{"city": c, "pollutant": p.upper(), "pct": (g[p] > lim).mean() * 100}
+                rows = [{"city": c, "pollutant": p.upper(), "pct": g[p].dropna().gt(lim).mean() * 100}
                         for c, g in df.groupby("city") for p, lim in ex]
                 eb = px.bar(pd.DataFrame(rows), x="city", y="pct", color="pollutant", barmode="group",
                             title="% of days above the India NAAQS 24-hour limit (" +
@@ -672,7 +675,7 @@ def historical_view(raw: pd.DataFrame, source_label: str = "uploaded CSV"):
         qa, qb = st.columns([1, 2])
         qa.dataframe(pd.DataFrame({"Check": list(q), "Count": list(q.values())}), width="stretch", hide_index=True)
         qb.markdown("**Cleaning steps:** parse dates → drop duplicate city-day rows → treat negative readings as missing → "
-                    "interpolate short gaps (up to 7 days) within each city → forward/back-fill the rest.")
+                    "interpolate short gaps (up to 7 rows) inside each city. Longer gaps are left empty, not invented.")
         show = df.drop(columns=["year", "month"])
         st.dataframe(show.tail(1000), width="stretch", hide_index=True)
         st.download_button("⬇️ Download filtered data (CSV)", show.to_csv(index=False).encode(),
@@ -711,7 +714,7 @@ if mode == MODES[1]:
 
 elif mode == MODES[2]:
     up = st.sidebar.file_uploader("Upload a CSV", type="csv",
-                                  help="Accepted formats: (1) IoT time series: timestamp, node, pm25, co2, temp, humidity "
+                                  help="One CSV at a time. Accepted formats: (1) IoT time series: timestamp, node, pm25, co2, temp, humidity "
                                        "(optional: region, lat, lon); (2) daily city history: city, date, aqi and/or pm25 "
                                        "(+ pm10, no2, so2, co, o3); (3) CPCB snapshot from data.gov.in.")
     if up is None:
